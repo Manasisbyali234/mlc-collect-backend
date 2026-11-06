@@ -27,12 +27,14 @@ app.post('/api/login', async (req, res) => {
 
 app.post('/api/otp/send', async (req, res) => {
   const mobile = (req.body.mobile || '').replace(/\s+/g, '');
-  const user = await User.findOne({ mobile, role: 'collector' });
-  if (!user) return res.status(404).json({ error: 'Mobile number not registered' });
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore[mobile] = { otp, expires: Date.now() + 5 * 60 * 1000 };
-  console.log(`OTP for ${mobile}: ${otp}`);
-  res.json({ message: 'OTP sent' });
+  // auto-create collector if not exists
+  let user = await User.findOne({ mobile, role: 'collector' });
+  if (!user) {
+    user = await User.create({ id: genId('USR'), name: mobile, mobile, role: 'collector', password: '' });
+  }
+  const otp = '123456'; // dummy OTP for demo
+  otpStore[mobile] = { otp, expires: Date.now() + 30 * 60 * 1000 };
+  res.json({ message: 'OTP sent', otp });
 });
 
 app.post('/api/otp/verify', (req, res) => {
