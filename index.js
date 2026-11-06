@@ -4,7 +4,7 @@ import cors from 'cors';
 import { connectDB, Member, Application, LoanAccount, Collection, Deposit, User, Target, SanctionLetter } from './db.js';
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 app.get('/', (req, res) => res.json({ status: 'MLC Backend is running' }));
