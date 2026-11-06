@@ -60,7 +60,13 @@ app.post('/api/set-password', async (req, res) => {
 });
 
 /* ── Members ── */
-app.get('/api/members', async (req, res) => res.json(await Member.find()));
+app.get('/api/members', async (req, res) => {
+  const { collectorId } = req.query;
+  if (!collectorId) return res.json(await Member.find());
+  const apps = await Application.find({ collectorId });
+  const memberIds = [...new Set(apps.map(a => a.memberId))];
+  res.json(await Member.find({ memberId: { $in: memberIds } }));
+});
 
 app.get('/api/members/:id', async (req, res) => {
   const m = await Member.findOne({ memberId: req.params.id });
@@ -76,7 +82,11 @@ app.post('/api/members', async (req, res) => {
 });
 
 /* ── Loan Applications ── */
-app.get('/api/applications', async (req, res) => res.json(await Application.find()));
+app.get('/api/applications', async (req, res) => {
+  const { collectorId } = req.query;
+  const filter = collectorId ? { collectorId } : {};
+  res.json(await Application.find(filter));
+});
 
 app.get('/api/applications/:id', async (req, res) => {
   const a = await Application.findOne({ appId: req.params.id });
@@ -122,7 +132,13 @@ app.patch('/api/applications/:id', async (req, res) => {
 });
 
 /* ── Loan Accounts ── */
-app.get('/api/loan-accounts', async (req, res) => res.json(await LoanAccount.find()));
+app.get('/api/loan-accounts', async (req, res) => {
+  const { collectorId } = req.query;
+  if (!collectorId) return res.json(await LoanAccount.find());
+  const apps = await Application.find({ collectorId });
+  const appIds = apps.map(a => a.appId);
+  res.json(await LoanAccount.find({ appId: { $in: appIds } }));
+});
 
 app.post('/api/loan-accounts', async (req, res) => {
   const account = await LoanAccount.create({ ...req.body, id: genId('MCS') });
@@ -270,11 +286,15 @@ app.get('/api/borrower/dashboard/:appId', async (req, res) => {
 
 /* ── Dashboard stats ── */
 app.get('/api/dashboard', async (req, res) => {
+  const { collectorId } = req.query;
+  const appFilter = collectorId ? { collectorId } : {};
+  const colFilter = collectorId ? { collectorId } : {};
   const [apps, members, collections, deposits, loanAccounts, users] = await Promise.all([
-    Application.find(), Member.find(), Collection.find(), Deposit.find(), LoanAccount.find(), User.find()
+    Application.find(appFilter), Member.find(), Collection.find(colFilter), Deposit.find(), LoanAccount.find(), User.find()
   ]);
+  const memberIds = collectorId ? [...new Set(apps.map(a => a.memberId))] : null;
   res.json({
-    totalMembers: members.length,
+    totalMembers: collectorId ? memberIds.length : members.length,
     totalApplications: apps.length,
     pendingApproval: apps.filter(a => a.status === 'Pending Admin Approval').length,
     approved: apps.filter(a => a.status === 'Approved').length,
