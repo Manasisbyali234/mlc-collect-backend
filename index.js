@@ -562,6 +562,7 @@ app.get('/api/reports/closing', async (req, res) => {
 });
 
 
+app.get('/api/reports/collector-performance', async (req, res) => {
   const { from, to } = req.query;
   const [apps, collections, loanAccounts, users] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), User.find()]);
   const result = users.filter(u => u.role === 'collector').map(col => {
