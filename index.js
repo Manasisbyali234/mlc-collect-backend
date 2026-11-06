@@ -7,6 +7,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.get('/', (req, res) => res.json({ status: 'MLC Backend is running' }));
+
 function genId(prefix) {
   return prefix + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
 }
