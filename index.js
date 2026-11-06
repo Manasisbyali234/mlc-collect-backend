@@ -1,11 +1,14 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import multer from 'multer';
 import { connectDB, Member, Application, LoanAccount, Collection, Deposit, User, Target, SanctionLetter } from './db.js';
 
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 app.get('/', (req, res) => res.json({ status: 'MLC Backend is running' }));
 
@@ -74,10 +77,50 @@ app.get('/api/members/:id', async (req, res) => {
   res.json(m);
 });
 
-app.post('/api/members', async (req, res) => {
-  const dup = await Member.findOne({ $or: [{ aadhaar: req.body.aadhaar }, { mobile: req.body.mobile }] });
+app.get('/api/members/:id/loans', async (req, res) => {
+  const apps = await Application.find({ memberId: req.params.id });
+  const collections = await Collection.find({ appId: { $in: apps.map(a => a.appId) } });
+  const loanAccounts = await LoanAccount.find({ appId: { $in: apps.map(a => a.appId) } });
+  const loans = apps.map(a => {
+    const la = loanAccounts.find(l => l.appId === a.appId);
+    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const totalPaid = cols.reduce((s, c) => s + Number(c.amount || 0), 0);
+    const loanAmount = Number(a.loanAmount || 0);
+    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+    const pending = Math.max(0, totalDue - totalPaid);
+    return { appId: a.appId, loanId: a.loanId || '', loanType: a.loanType, loanAmount, status: a.status, date: a.date, disbursalDate: a.disbursalDate || '', totalPaid, pending };
+  });
+  const totalLoanAmount = loans.reduce((s, l) => s + l.loanAmount, 0);
+  const totalPaidAll = loans.reduce((s, l) => s + l.totalPaid, 0);
+  res.json({ loans, count: loans.length, totalLoanAmount, totalPaidAll });
+});
+
+app.get('/api/members/:id/loans', async (req, res) => {
+  const apps = await Application.find({ memberId: req.params.id });
+  const collections = await Collection.find({ appId: { $in: apps.map(a => a.appId) } });
+  const loanAccounts = await LoanAccount.find({ appId: { $in: apps.map(a => a.appId) } });
+  const loans = apps.map(a => {
+    const la = loanAccounts.find(l => l.appId === a.appId);
+    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const totalPaid = cols.reduce((s, c) => s + Number(c.amount || 0), 0);
+    const loanAmount = Number(a.loanAmount || 0);
+    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+    const pending = Math.max(0, totalDue - totalPaid);
+    return { appId: a.appId, loanId: a.loanId || '', loanType: a.loanType, loanAmount, status: a.status, date: a.date, disbursalDate: a.disbursalDate || '', totalPaid, pending };
+  });
+  const totalLoanAmount = loans.reduce((s, l) => s + l.loanAmount, 0);
+  const totalPaidAll = loans.reduce((s, l) => s + l.totalPaid, 0);
+  res.json({ loans, count: loans.length, totalLoanAmount, totalPaidAll });
+});
+
+app.post('/api/members', upload.fields([{ name: 'photo', maxCount: 1 }, { name: 'shopImage', maxCount: 1 }]), async (req, res) => {
+  const body = req.body;
+  const dup = await Member.findOne({ $or: [{ aadhaar: body.aadhaar }, { mobile: body.mobile }] });
   if (dup) return res.status(409).json({ error: 'Member already registered with this Aadhaar/mobile' });
-  const member = await Member.create({ ...req.body, memberId: genId('MBR') });
+  const extra = {};
+  if (req.files?.photo?.[0]) extra.photo = `data:${req.files.photo[0].mimetype};base64,${req.files.photo[0].buffer.toString('base64')}`;
+  if (req.files?.shopImage?.[0]) extra.shopImage = `data:${req.files.shopImage[0].mimetype};base64,${req.files.shopImage[0].buffer.toString('base64')}`;
+  const member = await Member.create({ ...body, ...extra, memberId: genId('MBR') });
   res.status(201).json(member);
 });
 
@@ -101,7 +144,9 @@ app.get('/api/applications/:id', async (req, res) => {
   const pending = Math.max(0, totalDue - totalPaid);
   const penalty = calcPenalty(a, loanAccount, pending, collections);
   const schedule = buildSchedule(a, collections);
-  res.json({ ...a.toObject(), totalPaid, pending, penalty, totalPayable: pending + penalty, dailyEmi: DAILY_EMI, schedule });
+  const missedStreak = calcMissedStreak(schedule);
+  const npa = missedStreak > 10;
+  res.json({ ...a.toObject(), totalPaid, pending, penalty, totalPayable: pending + penalty, dailyEmi: DAILY_EMI, schedule, missedStreak, npa });
 });
 
 app.post('/api/applications', async (req, res) => {
@@ -129,6 +174,28 @@ app.patch('/api/applications/:id', async (req, res) => {
   const updated = await Application.findOneAndUpdate({ appId: req.params.id }, req.body, { new: true });
   if (!updated) return res.status(404).json({ error: 'Not found' });
   res.json(updated);
+});
+
+/* Auto-flag NPA: disbursed loans with >10 consecutive missed EMIs */
+app.post('/api/applications/auto-npa', async (req, res) => {
+  const apps = await Application.find({ status: 'Disbursed' });
+  const flagged = [];
+  for (const a of apps) {
+    const loanAccount = await LoanAccount.findOne({ appId: a.appId });
+    const collections = await Collection.find({ $or: [{ appId: a.appId }, { loanAccountId: loanAccount?.id }] });
+    const schedule = buildSchedule(a, collections);
+    const streak = calcMissedStreak(schedule);
+    if (streak > 10) {
+      await Application.findOneAndUpdate({ appId: a.appId }, {
+        status: 'NPA',
+        npaDate: new Date().toLocaleDateString('en-IN'),
+        missedStreak: streak,
+        $push: { statusHistory: { status: 'NPA', date: new Date().toLocaleString(), by: 'System (Auto)' } },
+      });
+      flagged.push(a.appId);
+    }
+  }
+  res.json({ flagged, count: flagged.length });
 });
 
 /* ── Loan Accounts ── */
@@ -162,8 +229,21 @@ app.post('/api/collections', async (req, res) => {
 /* ── Deposits ── */
 app.get('/api/deposits', async (req, res) => res.json(await Deposit.find()));
 
-app.post('/api/deposits', async (req, res) => {
-  const deposit = await Deposit.create({ ...req.body, id: genId('DEP'), status: 'To verify' });
+app.post('/api/deposits', upload.single('photo'), async (req, res) => {
+  const body = req.body;
+  let photoData = null;
+  if (req.file) {
+    photoData = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+  }
+  let location = null;
+  if (body.location) { try { location = JSON.parse(body.location); } catch {} }
+  const deposit = await Deposit.create({
+    ...body,
+    id: genId('DEP'),
+    status: 'To verify',
+    ...(photoData && { photo: photoData }),
+    ...(location && { location }),
+  });
   res.status(201).json(deposit);
 });
 
@@ -260,6 +340,18 @@ function calcPenalty(app, loanAccount, pending, collections) {
   return overdueDays === 0 ? 0 : Math.round(pending * 0.03 * overdueDays);
 }
 
+function calcMissedStreak(schedule) {
+  // Returns the current consecutive missed days streak (from today backwards)
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const past = schedule.filter(s => s.status === 'Missed' || s.status === 'Paid');
+  let streak = 0;
+  for (let i = past.length - 1; i >= 0; i--) {
+    if (past[i].status === 'Missed') streak++;
+    else break;
+  }
+  return streak;
+}
+
 app.get('/api/borrower/dashboard/:appId', async (req, res) => {
   const a = await Application.findOne({ appId: req.params.appId });
   if (!a) return res.status(404).json({ error: 'Not found' });
@@ -303,6 +395,7 @@ app.get('/api/dashboard', async (req, res) => {
     pendingDeposits: deposits.filter(d => d.status === 'To verify').length,
     totalCollectors: users.filter(u => u.role === 'collector').length,
     totalLoanAccounts: loanAccounts.length,
+    totalNPA: apps.filter(a => a.status === 'NPA').length,
   });
 });
 
@@ -451,7 +544,24 @@ app.get('/api/reports/paid', async (req, res) => {
   res.json(rows);
 });
 
-app.get('/api/reports/collector-wise', async (req, res) => {
+app.get('/api/reports/closing', async (req, res) => {
+  const { from, to, collectorId } = req.query;
+  const [apps, collections, loanAccounts, members] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), Member.find()]);
+  const rows = [];
+  apps.filter(a => a.status === 'Disbursed').forEach(a => {
+    const { allCols, totalPaid, loanAmount, pending } = rLoanStats(a, loanAccounts, collections);
+    if (pending > 0) return;
+    if (collectorId && a.collectorId !== collectorId && a.collectorName !== collectorId) return;
+    const member = members.find(m => m.memberId === a.memberId) || {};
+    const lastCol = [...allCols].sort((x, y) => (rParseDate(y.date || y.collectionDate) || 0) - (rParseDate(x.date || x.collectionDate) || 0))[0];
+    const closeDate = lastCol ? (lastCol.date || lastCol.collectionDate || '') : '';
+    if (from && to && closeDate && !rInRange(closeDate, from, to)) return;
+    rows.push({ loanId: a.loanId || a.appId, appId: a.appId, memberName: a.memberName, memberId: a.memberId, mobile: a.mobile || member.mobile || '', collectorName: a.collectorName, loanType: a.loanType || '', loanAmount, totalPaid, disbursalDate: a.disbursalDate || '', closeDate, status: 'Closed' });
+  });
+  res.json(rows);
+});
+
+
   const { from, to } = req.query;
   const [apps, collections, loanAccounts, users] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), User.find()]);
   const result = users.filter(u => u.role === 'collector').map(col => {
