@@ -367,7 +367,8 @@ app.get('/api/borrower/dashboard/:appId', async (req, res) => {
   const missedDays = schedule.filter(s => s.status === 'Missed').length;
   const todayKey = toDateKey(new Date());
   res.json({
-    appId: a.appId, status: a.status, loanAmount, totalDue, totalPaid, pending, penalty,
+    appId: a.appId, status: a.status, loanAmount, netDisbursalAmount: Number(a.netDisbursalAmount || 0) || null,
+    totalDue, totalPaid, pending, penalty,
     totalPayable: pending + penalty, dailyEmi: DAILY_EMI, missedDays,
     todayDue: schedule.find(s => s.date === todayKey) || null,
     memberName: member?.name || '', mobile: member?.mobile || '',
