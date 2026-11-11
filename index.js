@@ -119,8 +119,13 @@ app.get('/api/members/:id/loans', async (req, res) => {
 
 app.post('/api/members', upload.fields([{ name: 'photo', maxCount: 1 }, { name: 'shopImage', maxCount: 1 }]), async (req, res) => {
   const body = req.body;
-  const dup = await Member.findOne({ $or: [{ aadhaar: body.aadhaar }, { mobile: body.mobile }] });
-  if (dup) return res.status(409).json({ error: 'Member already registered with this Aadhaar/mobile' });
+  const orClauses = [];
+  if (body.aadhaar) orClauses.push({ aadhaar: body.aadhaar });
+  if (body.mobile) orClauses.push({ mobile: body.mobile });
+  if (orClauses.length) {
+    const dup = await Member.findOne({ $or: orClauses });
+    if (dup) return res.status(409).json({ error: 'Member already registered with this Aadhaar/mobile' });
+  }
   const extra = {};
   if (req.files?.photo?.[0]) extra.photo = `data:${req.files.photo[0].mimetype};base64,${req.files.photo[0].buffer.toString('base64')}`;
   if (req.files?.shopImage?.[0]) extra.shopImage = `data:${req.files.shopImage[0].mimetype};base64,${req.files.shopImage[0].buffer.toString('base64')}`;
