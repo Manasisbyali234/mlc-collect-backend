@@ -66,7 +66,11 @@ app.post('/api/set-password', async (req, res) => {
 app.get('/api/members', async (req, res) => {
   const { collectorId } = req.query;
   if (!collectorId) return res.json(await Member.find());
-  const apps = await Application.find({ collectorId });
+  const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
+  const filter = user
+    ? { $or: [{ collectorId: user.id }, { collectorId: user.mobile }, { collectorName: user.name }] }
+    : { $or: [{ collectorId }, { collectorName: collectorId }] };
+  const apps = await Application.find(filter);
   const memberIds = [...new Set(apps.map(a => a.memberId))];
   res.json(await Member.find({ memberId: { $in: memberIds } }));
 });
@@ -127,7 +131,11 @@ app.post('/api/members', upload.fields([{ name: 'photo', maxCount: 1 }, { name: 
 /* ── Loan Applications ── */
 app.get('/api/applications', async (req, res) => {
   const { collectorId } = req.query;
-  const filter = collectorId ? { collectorId } : {};
+  if (!collectorId) return res.json(await Application.find());
+  const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
+  const filter = user
+    ? { $or: [{ collectorId: user.id }, { collectorId: user.mobile }, { collectorName: user.name }] }
+    : { $or: [{ collectorId }, { collectorName: collectorId }] };
   res.json(await Application.find(filter));
 });
 
@@ -202,7 +210,11 @@ app.post('/api/applications/auto-npa', async (req, res) => {
 app.get('/api/loan-accounts', async (req, res) => {
   const { collectorId } = req.query;
   if (!collectorId) return res.json(await LoanAccount.find());
-  const apps = await Application.find({ collectorId });
+  const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
+  const filter = user
+    ? { $or: [{ collectorId: user.id }, { collectorId: user.mobile }, { collectorName: user.name }] }
+    : { $or: [{ collectorId }, { collectorName: collectorId }] };
+  const apps = await Application.find(filter);
   const appIds = apps.map(a => a.appId);
   res.json(await LoanAccount.find({ appId: { $in: appIds } }));
 });
@@ -216,7 +228,12 @@ app.post('/api/loan-accounts', async (req, res) => {
 app.get('/api/collections', async (req, res) => {
   const { collectorId, date } = req.query;
   const filter = {};
-  if (collectorId) filter.collectorId = collectorId;
+  if (collectorId) {
+    const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
+    filter.$or = user
+      ? [{ collectorId: user.id }, { collectorId: user.mobile }, { collectorName: user.name }]
+      : [{ collectorId }, { collectorName: collectorId }];
+  }
   if (date) filter.date = date;
   res.json(await Collection.find(filter));
 });
