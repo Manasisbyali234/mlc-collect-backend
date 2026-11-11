@@ -221,8 +221,13 @@ app.get('/api/collections', async (req, res) => {
   res.json(await Collection.find(filter));
 });
 
-app.post('/api/collections', async (req, res) => {
-  const record = await Collection.create({ ...req.body, id: genId('COL') });
+app.post('/api/collections', upload.single('photo'), async (req, res) => {
+  const body = req.body;
+  let photoData = null;
+  if (req.file) photoData = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+  let location = null;
+  if (body.location) { try { location = JSON.parse(body.location); } catch {} }
+  const record = await Collection.create({ ...body, id: genId('COL'), ...(photoData && { photo: photoData }), ...(location && { location }) });
   res.status(201).json(record);
 });
 
@@ -372,7 +377,7 @@ app.get('/api/borrower/dashboard/:appId', async (req, res) => {
     totalPayable: pending + penalty, dailyEmi: DAILY_EMI, missedDays,
     todayDue: schedule.find(s => s.date === todayKey) || null,
     memberName: member?.name || '', mobile: member?.mobile || '',
-    collections: collections.map(c => ({ date: c.date, amount: c.amount, id: c.id })),
+    collections: collections.map(c => ({ id: c.id, date: c.date, collectionDate: c.collectionDate, amount: c.amount, mode: c.mode, reference: c.reference, photo: c.photo, location: c.location })),
     schedule, loanAccount: loanAccount || null,
   });
 });
