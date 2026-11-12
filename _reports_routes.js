@@ -340,6 +340,48 @@ app.get('/api/reports/collector-wise', (req, res) => {
   res.json(result);
 });
 
+/* ── Reports: Loan Details ── */
+app.get('/api/reports/loan-details', (req, res) => {
+  const db = getDB();
+  const { applications: apps, collections, loanAccounts, members } = db;
+  const rows = [];
+  apps.filter(a => ['Disbursed','Sanctioned','Approved'].includes(a.status)).forEach(a => {
+    const { totalPaid, loanAmount, pending } = calcLoanStats(a, loanAccounts, collections);
+    const member = members.find(m => m.memberId === a.memberId) || {};
+    const tenure = Number(a.approvedTenure || a.tenure || 0);
+    // sanction date
+    const sanctionDate = (a.statusHistory || []).find(h => h.status === 'Sanctioned')?.date
+      || (a.statusHistory || []).find(h => h.status === 'Approved')?.date
+      || a.date || '';
+    // loan end date = disbursal + tenure days
+    let loanEndDate = '';
+    if (a.disbursalDate && tenure) {
+      const start = parseDate(a.disbursalDate);
+      if (start) { const d = new Date(start); d.setDate(d.getDate() + tenure); loanEndDate = isoDate(d); }
+    }
+    // next due date = today or end date whichever is sooner (simple: use end date)
+    const dueDate = loanEndDate;
+    rows.push({
+      memberName: a.memberName,
+      memberId: a.memberId,
+      loanId: a.loanId || a.appId,
+      appId: a.appId,
+      mobile: a.mobile || member.mobile || '',
+      collectorName: a.collectorName || '',
+      loanType: a.loanType || '',
+      sanctionedAmount: Number(a.sanctionAmount || a.loanAmount || 0),
+      sanctionDate,
+      disbursalDate: a.disbursalDate || '',
+      loanEndDate,
+      dueDate,
+      totalCollected: totalPaid,
+      remaining: pending,
+      status: a.status,
+    });
+  });
+  res.json(rows);
+});
+
 /* ── Sanction Letters ── */
 app.get('/api/sanction-letters', (req, res) => {
   const db = getDB();

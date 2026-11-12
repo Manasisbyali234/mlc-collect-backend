@@ -413,6 +413,17 @@ app.get('/api/dashboard', async (req, res) => {
     Application.find(appFilter), Member.find(), Collection.find(colFilter), Deposit.find(), LoanAccount.find(), User.find()
   ]);
   const memberIds = collectorId ? [...new Set(apps.map(a => a.memberId))] : null;
+  const now = new Date();
+  const todayDD = String(now.getDate()).padStart(2, '0');
+  const todayMM = String(now.getMonth() + 1).padStart(2, '0');
+  const todayYYYY = now.getFullYear();
+  const todayDDMMYYYY = `${todayDD}/${todayMM}/${todayYYYY}`;
+  const todayISO = `${todayYYYY}-${todayMM}-${todayDD}`;
+  const todayCollected = collections.filter(c => {
+    const d = c.date || c.collectionDate || '';
+    return d === todayDDMMYYYY || d.slice(0, 10) === todayISO;
+  }).reduce((s, c) => s + (Number(c.amount) || 0), 0);
+  const liveMarketTotal = apps.filter(a => a.status === 'Disbursed').reduce((s, a) => s + (Number(a.loanAmount) || 0), 0);
   res.json({
     totalMembers: collectorId ? memberIds.length : members.length,
     totalApplications: apps.length,
@@ -420,6 +431,8 @@ app.get('/api/dashboard', async (req, res) => {
     approved: apps.filter(a => a.status === 'Approved').length,
     disbursed: apps.filter(a => a.status === 'Disbursed').length,
     totalCollected: collections.reduce((s, c) => s + (Number(c.amount) || 0), 0),
+    todayCollected,
+    liveMarketTotal,
     pendingDeposits: deposits.filter(d => d.status === 'To verify').length,
     totalCollectors: users.filter(u => u.role === 'collector').length,
     totalLoanAccounts: loanAccounts.length,
@@ -589,6 +602,74 @@ app.get('/api/reports/closing', async (req, res) => {
   res.json(rows);
 });
 
+
+app.get('/api/reports/collector-wise', async (req, res) => {
+  const { from, to } = req.query;
+  const [apps, collections, loanAccounts, users] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), User.find()]);
+  const result = users.filter(u => u.role === 'collector').map(col => {
+    const colApps = apps.filter(a => a.collectorId === col.id || a.collectorName === col.name);
+    const disbursed = colApps.filter(a => a.status === 'Disbursed');
+    const periodCols = collections.filter(c => { const isCol = c.collectorId === col.id || c.collectorName === col.name; return isCol && (from && to ? rInRange(c.date || c.collectionDate, from, to) : true); });
+    const totalCollected = periodCols.reduce((s, c) => s + Number(c.amount || 0), 0);
+    const paidSet = new Set(periodCols.map(c => c.appId));
+    const totalOutstanding = disbursed.reduce((s, a) => s + rLoanStats(a, loanAccounts, collections).pending, 0);
+    const totalLoanAmount = disbursed.reduce((s, a) => s + Number(a.loanAmount || 0), 0);
+    return { collectorId: col.id, collectorName: col.name, branch: col.branch || '', totalMembersAssigned: colApps.length, totalLoansProcessed: disbursed.length, totalLoanAmount, totalCollected, paidMembersCount: paidSet.size, pendingMembersCount: disbursed.length - paidSet.size, totalOutstanding, collectionPercentage: totalLoanAmount > 0 ? ((totalCollected / totalLoanAmount) * 100).toFixed(1) : '0.0' };
+  });
+  res.json(result);
+});
+
+app.get('/api/reports/loan-details', async (req, res) => {
+  const [apps, collections, loanAccounts, members] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), Member.find()]);
+  const rows = [];
+  apps.filter(a => ['Disbursed', 'Sanctioned', 'Approved'].includes(a.status)).forEach(a => {
+    const { totalPaid, loanAmount, pending } = rLoanStats(a, loanAccounts, collections);
+    const member = members.find(m => m.memberId === a.memberId) || {};
+    const tenure = Number(a.approvedTenure || a.tenure || 0);
+    const sanctionDate = (a.statusHistory || []).find(h => h.status === 'Sanctioned')?.date
+      || (a.statusHistory || []).find(h => h.status === 'Approved')?.date
+      || a.date || '';
+    let loanEndDate = '';
+    if (a.disbursalDate && tenure) {
+      const start = rParseDate(a.disbursalDate);
+      if (start) { const d = new Date(start); d.setDate(d.getDate() + tenure); loanEndDate = rIso(d); }
+    }
+    rows.push({
+      memberName: a.memberName, memberId: a.memberId,
+      loanId: a.loanId || a.appId, appId: a.appId,
+      mobile: a.mobile || member.mobile || '',
+      collectorName: a.collectorName || '',
+      loanType: a.loanType || '',
+      sanctionedAmount: Number(a.sanctionAmount || a.loanAmount || 0),
+      sanctionDate, disbursalDate: a.disbursalDate || '',
+      loanEndDate, dueDate: loanEndDate,
+      totalCollected: totalPaid, remaining: pending, status: a.status,
+    });
+  });
+  res.json(rows);
+});
+
+app.get('/api/reports/missed-emi', async (req, res) => {
+  const [apps, collections, loanAccounts, members] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), Member.find()]);
+  const rows = [];
+  apps.filter(a => ['Disbursed', 'NPA'].includes(a.status)).forEach(a => {
+    const la = loanAccounts.find(l => l.appId === a.appId);
+    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const schedule = buildSchedule(a, cols);
+    const missedDays = schedule.filter(s => s.status === 'Missed');
+    if (missedDays.length === 0) return;
+    const streak = calcMissedStreak(schedule);
+    const member = members.find(m => m.memberId === a.memberId) || {};
+    rows.push({
+      appId: a.appId, loanId: a.loanId || '', memberName: a.memberName, memberId: a.memberId,
+      mobile: a.mobile || member.mobile || '', collectorName: a.collectorName,
+      loanAmount: Number(a.loanAmount || 0), disbursalDate: a.disbursalDate || '',
+      totalMissed: missedDays.length, missedStreak: streak, status: a.status,
+    });
+  });
+  rows.sort((a, b) => b.totalMissed - a.totalMissed);
+  res.json(rows);
+});
 
 app.get('/api/reports/collector-performance', async (req, res) => {
   const { from, to } = req.query;
