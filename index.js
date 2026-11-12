@@ -22,7 +22,7 @@ const otpStore = {};
 app.post('/api/login', async (req, res) => {
   const mobile = (req.body.mobile || '').replace(/\s+/g, '');
   const { password } = req.body;
-  const user = await User.findOne({ $or: [{ mobile }, { id: mobile }], password });
+  const user = await User.findOne({ $or: [{ mobile }, { id: mobile }, { name: mobile }], password });
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
   const { password: _, ...safe } = user.toObject();
   res.json(safe);
@@ -290,6 +290,11 @@ app.post('/api/users', async (req, res) => {
   const user = await User.create({ ...req.body, id: genId('USR') });
   const { password: _, ...safe } = user.toObject();
   res.status(201).json(safe);
+});
+
+app.delete('/api/users/:id', async (req, res) => {
+  await User.deleteOne({ id: req.params.id });
+  res.json({ ok: true });
 });
 
 /* ── Targets ── */
@@ -671,6 +676,332 @@ app.get('/api/reports/missed-emi', async (req, res) => {
   res.json(rows);
 });
 
+/* ── Individual Customer Detailed Report ── */
+app.get('/api/reports/customer/:memberId', async (req, res) => {
+  const { memberId } = req.params;
+  const member = await Member.findOne({ memberId });
+  if (!member) return res.status(404).json({ error: 'Member not found' });
+
+  const apps = await Application.find({ memberId });
+  const appIds = apps.map(a => a.appId);
+  const [loanAccounts, collections] = await Promise.all([
+    LoanAccount.find({ appId: { $in: appIds } }),
+    Collection.find({ appId: { $in: appIds } }),
+  ]);
+
+  // Build per-loan schedule for late payment detection
+  function buildLoanSchedule(a, cols) {
+    if (!a.disbursalDate) return [];
+    const tenure = Number(a.approvedTenure || a.tenure || 0);
+    if (!tenure) return [];
+    const start = rParseDate(a.disbursalDate);
+    if (!start) return [];
+    const paidByDate = {};
+    cols.forEach(c => {
+      const key = rIso(rParseDate(c.date || c.collectionDate));
+      if (key) paidByDate[key] = (paidByDate[key] || 0) + Number(c.amount || 0);
+    });
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    return Array.from({ length: tenure }, (_, i) => {
+      const d = new Date(start); d.setDate(d.getDate() + i);
+      const key = rIso(d);
+      const paid = paidByDate[key] || 0;
+      return { day: i + 1, date: key, due: DAILY_EMI, paid, status: paid >= DAILY_EMI ? 'Paid' : d <= today ? 'Missed' : 'Upcoming' };
+    });
+  }
+
+  let totalLatePaymentsAll = 0;
+  const npaHistory = [];
+  const latePaymentSummary = [];
+
+  const loans = apps.map((a, idx) => {
+    const la = loanAccounts.find(l => l.appId === a.appId);
+    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const payCols = cols.filter(c => !c.isDeduction && c.type !== 'deduction');
+    const totalPaid = payCols.reduce((s, c) => s + Number(c.amount || 0), 0);
+    const loanAmount = Number(a.loanAmount || 0);
+    const interestRate = Number(a.confirmedRate || a.rate || 0);
+    const tenure = Number(a.approvedTenure || a.tenure || 0);
+    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+    const totalInterest = Math.max(0, totalDue - loanAmount);
+    const pending = Math.max(0, totalDue - totalPaid);
+    const dedCols = cols.filter(c => c.type === 'deduction' || c.isDeduction);
+    const totalDeduction = dedCols.reduce((s, c) => s + Number(c.amount || 0), 0);
+
+    // Processing fee: from field or loanAmount - netDisbursalAmount
+    const processingFee = Number(a.processingFee || 0) ||
+      (a.netDisbursalAmount ? Math.max(0, loanAmount - Number(a.netDisbursalAmount)) : 0);
+    const netDisbursed = loanAmount - processingFee;
+
+    // NPA info from statusHistory
+    const npaEntry = (a.statusHistory || []).find(h => h.status === 'NPA');
+    const isNPA = a.status === 'NPA' || !!npaEntry;
+    const npaDate = a.npaDate || (npaEntry ? npaEntry.date : '') || '';
+    const npaFlaggedBy = npaEntry ? (npaEntry.by || 'System') : (isNPA ? 'System' : '');
+
+    // Build schedule for late payment analysis
+    const schedule = buildLoanSchedule(a, payCols);
+    const missedStreak = calcMissedStreak(schedule);
+
+    // Late payment detection: compare each payment date to expected schedule date
+    const sortedPayCols = [...payCols].sort((x, y) =>
+      (rParseDate(x.date || x.collectionDate) || 0) - (rParseDate(y.date || y.collectionDate) || 0)
+    );
+    const paidDays = schedule.filter(s => s.status === 'Paid');
+    let latePayments = 0;
+    const lateDetails = [];
+    sortedPayCols.forEach((c, i) => {
+      const payDate = rParseDate(c.date || c.collectionDate);
+      const expectedDay = paidDays[i];
+      if (payDate && expectedDay) {
+        const expectedDate = rParseDate(expectedDay.date);
+        const daysLate = expectedDate ? Math.max(0, Math.floor((payDate - expectedDate) / 86400000)) : 0;
+        if (daysLate > 0) {
+          latePayments++;
+          lateDetails.push({ paymentDate: rIso(payDate), amount: Number(c.amount || 0), daysLate, collectedBy: c.collectorName || '' });
+        }
+      }
+    });
+    totalLatePaymentsAll += latePayments;
+
+    // NPA history entry
+    if (isNPA) {
+      npaHistory.push({
+        loanId: a.loanId || a.appId,
+        loanAmount,
+        disbursalDate: a.disbursalDate || '',
+        npaDate,
+        flaggedBy: npaFlaggedBy,
+        missedStreak,
+        pendingAmount: pending,
+        currentStatus: a.status,
+      });
+    }
+
+    // Late payment summary per loan
+    latePaymentSummary.push({
+      loanId: a.loanId || a.appId,
+      loanAmount,
+      disbursalDate: a.disbursalDate || '',
+      tenure,
+      paidOnTime: sortedPayCols.length - latePayments,
+      paidLate: latePayments,
+      missedDays: schedule.filter(s => s.status === 'Missed').length,
+      currentStreak: missedStreak,
+      status: a.status,
+      lateDetails,
+    });
+
+    return {
+      sl: idx + 1,
+      appId: a.appId,
+      loanId: a.loanId || a.appId,
+      loanType: a.loanType || '',
+      applicationDate: a.date || '',
+      loanDate: a.disbursalDate || a.date || '',
+      loanAmount, processingFee, netDisbursed,
+      interestRate, tenure,
+      totalInterest, totalPayable: totalDue,
+      totalPaid, totalDeduction, pending,
+      latePayments, missedStreak,
+      isNPA, npaDate, npaFlaggedBy,
+      status: a.status,
+      collectorName: a.collectorName || '',
+    };
+  });
+
+  // Payments with daysLate
+  const allPayCols = collections
+    .filter(c => !c.isDeduction && c.type !== 'deduction')
+    .sort((a, b) => (rParseDate(a.date || a.collectionDate) || 0) - (rParseDate(b.date || b.collectionDate) || 0));
+
+  const payments = allPayCols.map((c, i) => {
+    const app = apps.find(a => a.appId === c.appId);
+    const la = loanAccounts.find(l => l.appId === c.appId);
+    const appPayCols = allPayCols.filter(x => x.appId === c.appId);
+    const idx = appPayCols.findIndex(x => (x.id || x._id?.toString()) === (c.id || c._id?.toString()));
+    const loanAmount = Number(app?.loanAmount || 0);
+    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+    const paidBefore = appPayCols.slice(0, idx).reduce((s, x) => s + Number(x.amount || 0), 0);
+    const openingBalance = Math.max(0, totalDue - paidBefore);
+    const amt = Number(c.amount || 0);
+    const remainingBalance = Math.max(0, openingBalance - amt);
+
+    // Calculate daysLate for this payment
+    const schedule = app ? buildLoanSchedule(app, appPayCols) : [];
+    const paidScheduleDays = schedule.filter(s => s.status === 'Paid');
+    const expectedDay = paidScheduleDays[idx];
+    const payDate = rParseDate(c.date || c.collectionDate);
+    const expectedDate = expectedDay ? rParseDate(expectedDay.date) : null;
+    const daysLate = (payDate && expectedDate) ? Math.max(0, Math.floor((payDate - expectedDate) / 86400000)) : 0;
+
+    return {
+      sl: i + 1,
+      paymentDate: c.date || c.collectionDate || '',
+      loanId: c.appId,
+      loanIdDisplay: app ? (app.loanId || app.appId) : c.appId,
+      openingBalance, dailyPayment: amt,
+      principalPaid: amt, interestPaid: 0,
+      deductionAmount: 0, otherCharges: 0,
+      totalReceived: amt, remainingBalance,
+      daysLate, isLate: daysLate > 0,
+      paymentMode: c.mode || '',
+      collectedBy: c.collectorName || '',
+      transactionId: c.reference || c.id || '',
+    };
+  });
+
+  // Deductions: real deduction records + auto-generated processing fee rows
+  const deductionHistory = [];
+  collections.filter(c => c.isDeduction || c.type === 'deduction').forEach(c => {
+    deductionHistory.push({
+      deductionDate: c.date || c.collectionDate || '',
+      loanId: c.appId,
+      deductionType: c.deductionType || 'Deduction',
+      description: c.description || c.remarks || '',
+      deductionAmount: Number(c.amount || 0),
+      reason: c.reason || '',
+      approvedBy: c.approvedBy || c.collectorName || '',
+    });
+  });
+  // Add processing fee rows for each loan that has one
+  apps.forEach(a => {
+    const processingFee = Number(a.processingFee || 0) ||
+      (a.netDisbursalAmount ? Math.max(0, Number(a.loanAmount || 0) - Number(a.netDisbursalAmount)) : 0);
+    if (processingFee > 0) {
+      deductionHistory.unshift({
+        deductionDate: a.disbursalDate || a.date || '',
+        loanId: a.loanId || a.appId,
+        deductionType: 'Processing Fee',
+        description: `Processing fee deducted at disbursal for loan ${a.loanId || a.appId}`,
+        deductionAmount: processingFee,
+        reason: 'Deducted from sanctioned amount at time of disbursal',
+        approvedBy: a.collectorName || 'System',
+      });
+    }
+  });
+
+  const totalBorrowed = loans.reduce((s, l) => s + l.loanAmount, 0);
+  const totalPaidAll = loans.reduce((s, l) => s + l.totalPaid, 0);
+  const totalPendingAll = loans.reduce((s, l) => s + l.pending, 0);
+  const totalDeductionAll = loans.reduce((s, l) => s + l.totalDeduction, 0);
+  const totalProcessingFees = loans.reduce((s, l) => s + l.processingFee, 0);
+  const activeLoans = loans.filter(l => l.status === 'Disbursed').length;
+  const closedLoans = loans.filter(l => l.pending <= 0 || l.status === 'Closed').length;
+  const npaLoans = loans.filter(l => l.isNPA).length;
+
+  res.json({
+    member: member.toObject(),
+    summary: {
+      totalLoans: loans.length, activeLoans, closedLoans, npaLoans,
+      totalBorrowed, totalPaid: totalPaidAll,
+      totalPending: totalPendingAll, totalDeductions: totalDeductionAll,
+      totalProcessingFees,
+      totalLatePayments: totalLatePaymentsAll,
+      totalPrincipalPending: totalPendingAll,
+      totalInterestPending: 0,
+      otherPendingCharges: 0,
+      grandTotalPending: totalPendingAll,
+    },
+    loans,
+    payments,
+    deductions: deductionHistory,
+    npaHistory,
+    latePaymentSummary,
+  });
+});
+
+app.get('/api/reports/all-customers-loans', async (req, res) => {
+  const [members, apps, collections, loanAccounts] = await Promise.all([
+    Member.find(), Application.find(), Collection.find(), LoanAccount.find()
+  ]);
+  const rows = [];
+  let sl = 1;
+  members.forEach(m => {
+    const mApps = apps.filter(a => a.memberId === m.memberId);
+    mApps.forEach((a, idx) => {
+      const la = loanAccounts.find(l => l.appId === a.appId);
+      const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+      const payCols = cols.filter(c => !c.isDeduction && c.type !== 'deduction');
+      const totalPaid = payCols.reduce((s, c) => s + Number(c.amount || 0), 0);
+      const loanAmount = Number(a.loanAmount || 0);
+      const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+      const totalInterest = Math.max(0, totalDue - loanAmount);
+      const pending = Math.max(0, totalDue - totalPaid);
+      const dedCols = cols.filter(c => c.type === 'deduction' || c.isDeduction);
+      const totalDeduction = dedCols.reduce((s, c) => s + Number(c.amount || 0), 0);
+      const processingFee = Number(a.processingFee || 0) ||
+        (a.netDisbursalAmount ? Math.max(0, loanAmount - Number(a.netDisbursalAmount)) : 0);
+      const netDisbursed = loanAmount - processingFee;
+      const interestRate = Number(a.confirmedRate || a.rate || 0);
+      const tenure = Number(a.approvedTenure || a.tenure || 0);
+      const schedule = buildSchedule(a, payCols);
+      const missedStreak = calcMissedStreak(schedule);
+      const sortedPayCols = [...payCols].sort((x, y) =>
+        (rParseDate(x.date || x.collectionDate) || 0) - (rParseDate(y.date || y.collectionDate) || 0)
+      );
+      const paidDays = schedule.filter(s => s.status === 'Paid');
+      let latePayments = 0;
+      sortedPayCols.forEach((c, i) => {
+        const payDate = rParseDate(c.date || c.collectionDate);
+        const expectedDay = paidDays[i];
+        if (payDate && expectedDay) {
+          const expectedDate = rParseDate(expectedDay.date);
+          const daysLate = expectedDate ? Math.max(0, Math.floor((payDate - expectedDate) / 86400000)) : 0;
+          if (daysLate > 0) latePayments++;
+        }
+      });
+      const npaEntry = (a.statusHistory || []).find(h => h.status === 'NPA');
+      const isNPA = a.status === 'NPA' || !!npaEntry;
+      rows.push({
+        sl: sl++,
+        customerName: m.name,
+        customerId: m.memberId,
+        loanId: a.loanId || a.appId,
+        loanDate: a.disbursalDate || a.date || '',
+        loanAmount, processingFee, netDisbursed,
+        interestRate, tenure,
+        totalInterest, totalPayable: totalDue,
+        totalPaid, totalDeduction, pending,
+        latePayments, missedStreak,
+        isNPA, status: a.status,
+        collectorName: a.collectorName || '',
+      });
+    });
+  });
+  res.json(rows);
+});
+
+app.get('/api/reports/all-customers-summary', async (req, res) => {
+  const [members, apps, collections, loanAccounts] = await Promise.all([
+    Member.find(), Application.find(), Collection.find(), LoanAccount.find()
+  ]);
+  const rows = members.map(m => {
+    const mApps = apps.filter(a => a.memberId === m.memberId);
+    const appIds = mApps.map(a => a.appId);
+    const mCols = collections.filter(c => appIds.includes(c.appId));
+    const totalBorrowed = mApps.reduce((s, a) => s + Number(a.loanAmount || 0), 0);
+    const totalPaid = mCols.filter(c => !c.isDeduction).reduce((s, c) => s + Number(c.amount || 0), 0);
+    const totalDeductions = mCols.filter(c => c.isDeduction).reduce((s, c) => s + Number(c.amount || 0), 0);
+    const totalPending = mApps.reduce((s, a) => {
+      const la = loanAccounts.find(l => l.appId === a.appId);
+      const cols = mCols.filter(c => c.appId === a.appId);
+      const paid = cols.reduce((x, c) => x + Number(c.amount || 0), 0);
+      const due = Number(la ? la.totalDue || a.loanAmount : a.loanAmount);
+      return s + Math.max(0, due - paid);
+    }, 0);
+    const activeLoans = mApps.filter(a => a.status === 'Disbursed').length;
+    const closedLoans = mApps.filter(a => a.pending <= 0 || a.status === 'Closed').length;
+    return {
+      customerName: m.name, customerId: m.memberId, mobile: m.mobile || '',
+      totalLoans: mApps.length, totalBorrowed, totalPaid, totalDeductions, totalPending,
+      activeLoans, closedLoans,
+      status: activeLoans > 0 ? 'Active' : 'Closed',
+    };
+  });
+  res.json(rows);
+});
+
 app.get('/api/reports/collector-performance', async (req, res) => {
   const { from, to } = req.query;
   const [apps, collections, loanAccounts, users] = await Promise.all([Application.find(), Collection.find(), LoanAccount.find(), User.find()]);
@@ -685,6 +1016,122 @@ app.get('/api/reports/collector-performance', async (req, res) => {
     return { collectorId: col.id, collectorName: col.name, branch: col.branch || '', totalMembersAssigned: colApps.length, totalLoansProcessed: disbursed.length, totalLoanAmount, totalCollected, paidMembersCount: paidSet.size, pendingMembersCount: disbursed.length - paidSet.size, totalOutstanding, collectionPercentage: totalLoanAmount > 0 ? ((totalCollected / totalLoanAmount) * 100).toFixed(1) : '0.0' };
   });
   res.json(result);
+});
+
+/* ── Employee Ledger ── */
+app.get('/api/ledger/:memberId', async (req, res) => {
+  const { memberId } = req.params;
+  const { from, to } = req.query;
+  const member = await Member.findOne({ memberId });
+  if (!member) return res.status(404).json({ error: 'Member not found' });
+
+  const apps = await Application.find({ memberId });
+  const appIds = apps.map(a => a.appId);
+  const [loanAccounts, collections] = await Promise.all([
+    LoanAccount.find({ appId: { $in: appIds } }),
+    Collection.find({ appId: { $in: appIds } }),
+  ]);
+
+  // Build raw transactions
+  const txns = [];
+
+  // Loan disbursements
+  apps.forEach(a => {
+    if (!['Disbursed','NPA','Recovery','Recovered'].includes(a.status) && !a.disbursalDate) return;
+    const disbDate = a.disbursalDate || a.date || '';
+    if (!disbDate) return;
+    const loanAmount = Number(a.loanAmount || 0);
+    const la = loanAccounts.find(l => l.appId === a.appId);
+    const processingFee = Number(a.processingFee || 0) ||
+      (a.netDisbursalAmount ? Math.max(0, loanAmount - Number(a.netDisbursalAmount)) : 0);
+    txns.push({
+      rawDate: rParseDate(disbDate),
+      date: disbDate,
+      docNo: a.appId,
+      billNo: a.loanId || a.appId,
+      details: `Loan Disbursed – ${a.loanType || 'Loan'} (${a.appId})`,
+      debit: loanAmount,
+      credit: 0,
+      type: 'loan',
+    });
+    if (processingFee > 0) {
+      txns.push({
+        rawDate: rParseDate(disbDate),
+        date: disbDate,
+        docNo: a.appId,
+        billNo: a.loanId || a.appId,
+        details: `Processing Fee Deducted (${a.appId})`,
+        debit: 0,
+        credit: processingFee,
+        type: 'fee',
+      });
+    }
+  });
+
+  // Collections / payments
+  collections.forEach(c => {
+    const colDate = c.date || c.collectionDate || '';
+    if (!colDate) return;
+    const app = apps.find(a => a.appId === c.appId);
+    const isDeduction = c.isDeduction || c.type === 'deduction';
+    txns.push({
+      rawDate: rParseDate(colDate),
+      date: colDate,
+      docNo: c.id || '',
+      billNo: c.appId || '',
+      details: isDeduction
+        ? `${c.deductionType || 'Deduction'} – ${app ? (app.loanId || app.appId) : c.appId}`
+        : `Daily Collection / Payment Received – ${app ? (app.loanId || app.appId) : c.appId}${c.mode ? ' (' + c.mode + ')' : ''}`,
+      debit: 0,
+      credit: Number(c.amount || 0),
+      type: isDeduction ? 'deduction' : 'collection',
+    });
+  });
+
+  // Sort chronologically
+  txns.sort((a, b) => {
+    const da = a.rawDate ? a.rawDate.getTime() : 0;
+    const db = b.rawDate ? b.rawDate.getTime() : 0;
+    return da - db;
+  });
+
+  // Filter by date range
+  let filtered = txns;
+  if (from && to) {
+    filtered = txns.filter(t => {
+      if (!t.rawDate) return false;
+      const f = new Date(from); f.setHours(0,0,0,0);
+      const tEnd = new Date(to); tEnd.setHours(23,59,59,999);
+      return t.rawDate >= f && t.rawDate <= tEnd;
+    });
+  }
+
+  // Opening balance = sum of all txns before the filter range
+  let openingBalance = 0;
+  if (from) {
+    const beforeFilter = txns.filter(t => {
+      if (!t.rawDate) return false;
+      const f = new Date(from); f.setHours(0,0,0,0);
+      return t.rawDate < f;
+    });
+    beforeFilter.forEach(t => { openingBalance += t.debit - t.credit; });
+  }
+
+  // Running balance
+  let balance = openingBalance;
+  const rows = filtered.map((t, i) => {
+    balance += t.debit - t.credit;
+    return { ...t, rawDate: undefined, balance, sl: i + 1 };
+  });
+
+  const closingBalance = balance;
+
+  res.json({
+    member: { name: member.name, memberId: member.memberId, mobile: member.mobile || '' },
+    openingBalance,
+    closingBalance,
+    rows,
+  });
 });
 
 /* ── Sanction Letters ── */
