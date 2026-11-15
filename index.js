@@ -87,30 +87,20 @@ app.get('/api/members/:id/loans', async (req, res) => {
   const loanAccounts = await LoanAccount.find({ appId: { $in: apps.map(a => a.appId) } });
   const loans = apps.map(a => {
     const la = loanAccounts.find(l => l.appId === a.appId);
-    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const cols = collections.filter(c => c.appId === a.appId && !c.isDeduction && c.type !== 'deduction');
     const totalPaid = cols.reduce((s, c) => s + Number(c.amount || 0), 0);
     const loanAmount = Number(a.loanAmount || 0);
-    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+    const laDue = Number(la ? la.totalDue || 0 : 0);
+    const storedInterest = Number(a.interest || 0);
+    const interestRate = Number(a.confirmedRate || a.rate || 0);
+    const tenure = Number(a.approvedTenure || a.tenure || 0);
+    const calcInterest = storedInterest > 0 ? storedInterest
+      : (interestRate > 0 && tenure > 0 ? Math.round(loanAmount * interestRate / 100) : 0);
+    const totalDue = laDue > loanAmount ? laDue : loanAmount + calcInterest;
     const pending = Math.max(0, totalDue - totalPaid);
-    return { appId: a.appId, loanId: a.loanId || '', loanType: a.loanType, loanAmount, status: a.status, date: a.date, disbursalDate: a.disbursalDate || '', totalPaid, pending };
-  });
-  const totalLoanAmount = loans.reduce((s, l) => s + l.loanAmount, 0);
-  const totalPaidAll = loans.reduce((s, l) => s + l.totalPaid, 0);
-  res.json({ loans, count: loans.length, totalLoanAmount, totalPaidAll });
-});
-
-app.get('/api/members/:id/loans', async (req, res) => {
-  const apps = await Application.find({ memberId: req.params.id });
-  const collections = await Collection.find({ appId: { $in: apps.map(a => a.appId) } });
-  const loanAccounts = await LoanAccount.find({ appId: { $in: apps.map(a => a.appId) } });
-  const loans = apps.map(a => {
-    const la = loanAccounts.find(l => l.appId === a.appId);
-    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
-    const totalPaid = cols.reduce((s, c) => s + Number(c.amount || 0), 0);
-    const loanAmount = Number(a.loanAmount || 0);
-    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
-    const pending = Math.max(0, totalDue - totalPaid);
-    return { appId: a.appId, loanId: a.loanId || '', loanType: a.loanType, loanAmount, status: a.status, date: a.date, disbursalDate: a.disbursalDate || '', totalPaid, pending };
+    const emi = Number(a.emi || DAILY_EMI);
+    const tenure2 = Number(a.approvedTenure || a.tenure || 55);
+    return { appId: a.appId, loanId: a.loanId || '', loanType: a.loanType, loanAmount, totalDue, status: a.status, date: a.date, disbursalDate: a.disbursalDate || '', totalPaid, pending, emi, tenure: tenure2 };
   });
   const totalLoanAmount = loans.reduce((s, l) => s + l.loanAmount, 0);
   const totalPaidAll = loans.reduce((s, l) => s + l.totalPaid, 0);
@@ -148,9 +138,7 @@ app.get('/api/applications/:id', async (req, res) => {
   const a = await Application.findOne({ appId: req.params.id });
   if (!a) return res.status(404).json({ error: 'Not found' });
   const loanAccount = await LoanAccount.findOne({ appId: req.params.id });
-  const collections = await Collection.find({
-    $or: [{ appId: req.params.id }, { loanAccountId: loanAccount?.id }]
-  });
+  const collections = await Collection.find({ appId: req.params.id });
   const totalPaid = collections.reduce((s, c) => s + (Number(c.amount) || 0), 0);
   const loanAmount = Number(a.loanAmount || a.amount || 0);
   const totalDue = Number(loanAccount ? loanAccount.totalDue || loanAmount : loanAmount);
@@ -171,7 +159,7 @@ app.post('/api/applications', async (req, res) => {
     if (activeLoan) {
       const la = await LoanAccount.findOne({ appId: activeLoan.appId });
       const totalDue = Number(la ? la.totalDue || activeLoan.loanAmount : activeLoan.loanAmount);
-      const cols = await Collection.find({ $or: [{ appId: activeLoan.appId }, { loanAccountId: la?.id }] });
+      const cols = await Collection.find({ appId: activeLoan.appId });
       const paid = cols.reduce((s, c) => s + (Number(c.amount) || 0), 0);
       const paidPct = totalDue > 0 ? (paid / totalDue) * 100 : 0;
       if (paidPct < 50) return res.status(400).json({ error: `Cannot apply for a new loan. Active loan (${activeLoan.appId}) is only ${paidPct.toFixed(1)}% repaid.` });
@@ -195,7 +183,7 @@ app.post('/api/applications/auto-npa', async (req, res) => {
   const flagged = [];
   for (const a of apps) {
     const loanAccount = await LoanAccount.findOne({ appId: a.appId });
-    const collections = await Collection.find({ $or: [{ appId: a.appId }, { loanAccountId: loanAccount?.id }] });
+    const collections = await Collection.find({ appId: a.appId });
     const schedule = buildSchedule(a, collections);
     const streak = calcMissedStreak(schedule);
     if (streak > 10) {
@@ -316,6 +304,39 @@ app.patch('/api/targets/:id', async (req, res) => {
   res.json(updated);
 });
 
+/* ── Collector NPA List ── */
+app.get('/api/collector/npa', async (req, res) => {
+  const { collectorId } = req.query;
+  const user = collectorId ? await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] }) : null;
+  const colFilter = user
+    ? { $or: [{ collectorId: user.id }, { collectorId: user.mobile }, { collectorName: user.name }], status: { $in: ['NPA', 'Disbursed'] } }
+    : { status: { $in: ['NPA', 'Disbursed'] } };
+  const apps = await Application.find(colFilter);
+  const rows = [];
+  for (const a of apps) {
+    const la = await LoanAccount.findOne({ appId: a.appId });
+    const cols = await Collection.find({ appId: a.appId });
+    // buildSchedule only runs for 'Disbursed'; for NPA loans use a relaxed version
+    const scheduleApp = a.status === 'NPA' ? { ...a.toObject(), status: 'Disbursed' } : a;
+    const schedule = buildSchedule(scheduleApp, cols);
+    const streak = calcMissedStreak(schedule);
+    const totalMissed = schedule.filter(s => s.status === 'Missed').length;
+    if (a.status === 'NPA' || streak > 10 || totalMissed > 10) {
+      const totalPaid = cols.reduce((s, c) => s + Number(c.amount || 0), 0);
+      const loanAmount = Number(a.loanAmount || 0);
+      const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+      const pending = Math.max(0, totalDue - totalPaid);
+      rows.push({
+        appId: a.appId, memberName: a.memberName, memberId: a.memberId,
+        mobile: a.mobile || '', loanAmount, disbursalDate: a.disbursalDate || '',
+        missedStreak: streak, totalMissed, pendingAmount: pending,
+        npaDate: a.npaDate || '', status: a.status,
+      });
+    }
+  }
+  res.json(rows);
+});
+
 /* ── Borrower Portal ── */
 app.post('/api/borrower/login', async (req, res) => {
   const { appId, mobile } = req.body;
@@ -389,7 +410,7 @@ app.get('/api/borrower/dashboard/:appId', async (req, res) => {
   if (!a) return res.status(404).json({ error: 'Not found' });
   const member = await Member.findOne({ memberId: a.memberId });
   const loanAccount = await LoanAccount.findOne({ appId: req.params.appId });
-  const collections = await Collection.find({ $or: [{ appId: req.params.appId }, { loanAccountId: loanAccount?.id }] });
+  const collections = await Collection.find({ appId: req.params.appId });
   const totalPaid = collections.reduce((s, c) => s + (Number(c.amount) || 0), 0);
   const loanAmount = Number(a.loanAmount || a.amount || 0);
   const totalDue = Number(loanAccount ? loanAccount.totalDue || loanAmount : loanAmount);
@@ -459,7 +480,7 @@ function rInRange(dateStr, from, to) {
 }
 function rLoanStats(a, loanAccounts, collections) {
   const la = loanAccounts.find(l => l.appId === a.appId);
-  const allCols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+  const allCols = collections.filter(c => c.appId === a.appId);
   const totalPaid = allCols.reduce((s, c) => s + Number(c.amount || 0), 0);
   const loanAmount = Number(a.loanAmount || 0);
   const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
@@ -659,7 +680,7 @@ app.get('/api/reports/missed-emi', async (req, res) => {
   const rows = [];
   apps.filter(a => ['Disbursed', 'NPA'].includes(a.status)).forEach(a => {
     const la = loanAccounts.find(l => l.appId === a.appId);
-    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const cols = collections.filter(c => c.appId === a.appId);
     const schedule = buildSchedule(a, cols);
     const missedDays = schedule.filter(s => s.status === 'Missed');
     if (missedDays.length === 0) return;
@@ -716,13 +737,17 @@ app.get('/api/reports/customer/:memberId', async (req, res) => {
 
   const loans = apps.map((a, idx) => {
     const la = loanAccounts.find(l => l.appId === a.appId);
-    const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+    const cols = collections.filter(c => c.appId === a.appId);
     const payCols = cols.filter(c => !c.isDeduction && c.type !== 'deduction');
     const totalPaid = payCols.reduce((s, c) => s + Number(c.amount || 0), 0);
     const loanAmount = Number(a.loanAmount || 0);
     const interestRate = Number(a.confirmedRate || a.rate || 0);
     const tenure = Number(a.approvedTenure || a.tenure || 0);
-    const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+    const storedInterest = Number(a.interest || 0);
+    const calcInterest = storedInterest > 0 ? storedInterest
+      : (interestRate > 0 && tenure > 0 ? Math.round(loanAmount * (interestRate / 100) * (tenure / 365)) : 0);
+    const laDue = Number(la ? la.totalDue || 0 : 0);
+    const totalDue = laDue > loanAmount ? laDue : loanAmount + calcInterest;
     const totalInterest = Math.max(0, totalDue - loanAmount);
     const pending = Math.max(0, totalDue - totalPaid);
     const dedCols = cols.filter(c => c.type === 'deduction' || c.isDeduction);
@@ -921,11 +946,17 @@ app.get('/api/reports/all-customers-loans', async (req, res) => {
     const mApps = apps.filter(a => a.memberId === m.memberId);
     mApps.forEach((a, idx) => {
       const la = loanAccounts.find(l => l.appId === a.appId);
-      const cols = collections.filter(c => c.appId === a.appId || c.loanAccountId === (la && la.id));
+      const cols = collections.filter(c => c.appId === a.appId);
       const payCols = cols.filter(c => !c.isDeduction && c.type !== 'deduction');
       const totalPaid = payCols.reduce((s, c) => s + Number(c.amount || 0), 0);
       const loanAmount = Number(a.loanAmount || 0);
-      const totalDue = Number(la ? la.totalDue || loanAmount : loanAmount);
+      const interestRate = Number(a.confirmedRate || a.rate || 0);
+      const tenure = Number(a.approvedTenure || a.tenure || 0);
+      const storedInterest = Number(a.interest || 0);
+      const calcInterest = storedInterest > 0 ? storedInterest
+        : (interestRate > 0 && tenure > 0 ? Math.round(loanAmount * (interestRate / 100) * (tenure / 365)) : 0);
+      const laDue = Number(la ? la.totalDue || 0 : 0);
+      const totalDue = laDue > loanAmount ? laDue : loanAmount + calcInterest;
       const totalInterest = Math.max(0, totalDue - loanAmount);
       const pending = Math.max(0, totalDue - totalPaid);
       const dedCols = cols.filter(c => c.type === 'deduction' || c.isDeduction);
@@ -933,8 +964,6 @@ app.get('/api/reports/all-customers-loans', async (req, res) => {
       const processingFee = Number(a.processingFee || 0) ||
         (a.netDisbursalAmount ? Math.max(0, loanAmount - Number(a.netDisbursalAmount)) : 0);
       const netDisbursed = loanAmount - processingFee;
-      const interestRate = Number(a.confirmedRate || a.rate || 0);
-      const tenure = Number(a.approvedTenure || a.tenure || 0);
       const schedule = buildSchedule(a, payCols);
       const missedStreak = calcMissedStreak(schedule);
       const sortedPayCols = [...payCols].sort((x, y) =>
