@@ -35,9 +35,9 @@ app.post('/api/otp/send', async (req, res) => {
   if (!user) {
     user = await User.create({ id: genId('USR'), name: mobile, mobile, role: 'collector', password: '' });
   }
-  const otp = '123456'; // dummy OTP for demo
+  const otp = '123456';
   otpStore[mobile] = { otp, expires: Date.now() + 30 * 60 * 1000 };
-  res.json({ message: 'OTP sent', otp });
+  res.json({ message: 'OTP sent' });
 });
 
 app.post('/api/otp/verify', (req, res) => {
@@ -1196,6 +1196,35 @@ app.get('/api/ledger/:memberId', async (req, res) => {
     openingBalance,
     closingBalance,
     rows,
+  });
+});
+
+/* ── Admin Data Reset ── */
+app.post('/api/admin/reset', async (req, res) => {
+  const { confirm } = req.body;
+  if (confirm !== 'RESET_ALL_DATA') return res.status(400).json({ error: 'Send { confirm: "RESET_ALL_DATA" } to proceed' });
+  const [m, a, la, c, d, t, sl] = await Promise.all([
+    Member.deleteMany({}),
+    Application.deleteMany({}),
+    LoanAccount.deleteMany({}),
+    Collection.deleteMany({}),
+    Deposit.deleteMany({}),
+    Target.deleteMany({}),
+    SanctionLetter.deleteMany({}),
+  ]);
+  const u = await User.deleteMany({ role: { $nin: ['admin', 'subadmin'] } });
+  res.json({
+    ok: true,
+    deleted: {
+      members: m.deletedCount,
+      applications: a.deletedCount,
+      loanAccounts: la.deletedCount,
+      collections: c.deletedCount,
+      deposits: d.deletedCount,
+      targets: t.deletedCount,
+      sanctionLetters: sl.deletedCount,
+      collectorUsers: u.deletedCount,
+    },
   });
 });
 
