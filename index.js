@@ -155,14 +155,29 @@ app.post('/api/applications', async (req, res) => {
   const existing = await Application.findOne({ appId });
   const isDraft = req.body.status === 'Draft';
   if (!isDraft && !existing && req.body.memberId) {
-    const activeLoan = await Application.findOne({ memberId: req.body.memberId, status: 'Disbursed' });
-    if (activeLoan) {
-      const la = await LoanAccount.findOne({ appId: activeLoan.appId });
-      const totalDue = Number(la ? la.totalDue || activeLoan.loanAmount : activeLoan.loanAmount);
-      const cols = await Collection.find({ appId: activeLoan.appId });
-      const paid = cols.reduce((s, c) => s + (Number(c.amount) || 0), 0);
-      const paidPct = totalDue > 0 ? (paid / totalDue) * 100 : 0;
-      if (paidPct < 50) return res.status(400).json({ error: `Cannot apply for a new loan. Active loan (${activeLoan.appId}) is only ${paidPct.toFixed(1)}% repaid.` });
+    const allLoans = await Application.find({ memberId: req.body.memberId, status: { $in: ['Disbursed', 'NPA', 'Approved'] } });
+    if (allLoans.length > 0) {
+      // Build pct for each loan
+      const loanStats = await Promise.all(allLoans.map(async a => {
+        const la = await LoanAccount.findOne({ appId: a.appId });
+        const cols = await Collection.find({ appId: a.appId });
+        const paid = cols.reduce((s, c) => s + (Number(c.amount) || 0), 0);
+        const totalDue = Number(la ? la.totalDue || a.loanAmount : a.loanAmount);
+        const pct = totalDue > 0 ? (paid / totalDue) * 100 : 0;
+        return { appId: a.appId, pct };
+      }));
+      const n = loanStats.length;
+      // All loans before the last must be 100% repaid
+      for (let i = 0; i < n - 1; i++) {
+        if (loanStats[i].pct < 100) {
+          return res.status(400).json({ error: `Loan ${i + 1} (${loanStats[i].appId}) must be 100% repaid before applying for Loan ${n + 1}. Currently ${loanStats[i].pct.toFixed(1)}% repaid.` });
+        }
+      }
+      // The last loan must be at least 50% repaid
+      const last = loanStats[n - 1];
+      if (last.pct < 50) {
+        return res.status(400).json({ error: `Loan ${n} (${last.appId}) must reach at least 50% repayment before applying for Loan ${n + 1}. Currently ${last.pct.toFixed(1)}% repaid.` });
+      }
     }
   }
   const record = existing
@@ -459,10 +474,31 @@ app.get('/api/dashboard', async (req, res) => {
     totalCollected: collections.reduce((s, c) => s + (Number(c.amount) || 0), 0),
     todayCollected,
     liveMarketTotal,
+    totalLoanValue: apps.reduce((s, a) => s + (Number(a.loanAmount) || 0), 0),
+    totalServiceChargeCollected: apps.filter(a => a.disbursalDate).reduce((s, a) => {
+      const fee = Number(a.processingFee || 0) || (a.netDisbursalAmount ? Math.max(0, Number(a.loanAmount || 0) - Number(a.netDisbursalAmount)) : 0);
+      return s + (fee > 0 ? fee : (a.disbursalDate ? 250 : 0));
+    }, 0),
+    totalInterestCollected: apps.filter(a => a.disbursalDate).reduce((s, a) => {
+      const loanAmount = Number(a.loanAmount || 0);
+      const rate = Number(a.confirmedRate || a.rate || 9);
+      return s + Math.round(loanAmount * rate / 100);
+    }, 0),
+    totalDoorstepCharges: apps.filter(a => a.disbursalDate).reduce((s, a) => {
+      const tenure = Number(a.approvedTenure || a.tenure || 0);
+      return s + Math.round(6.80 * tenure * 100) / 100;
+    }, 0),
+    closedLoans: apps.filter(a => a.status === 'Disbursed').filter(a => {
+      const la = loanAccounts.find(l => l.appId === a.appId);
+      const totalDue = Number(la ? la.totalDue || a.loanAmount : a.loanAmount);
+      const paid = collections.filter(c => c.appId === a.appId).reduce((s, c) => s + (Number(c.amount) || 0), 0);
+      return paid >= totalDue;
+    }).length,
     pendingDeposits: deposits.filter(d => d.status === 'To verify').length,
     totalCollectors: users.filter(u => u.role === 'collector').length,
     totalLoanAccounts: loanAccounts.length,
     totalNPA: apps.filter(a => a.status === 'NPA').length,
+    totalNPAValue: apps.filter(a => a.status === 'NPA').reduce((s, a) => s + (Number(a.loanAmount) || 0), 0),
   });
 });
 
