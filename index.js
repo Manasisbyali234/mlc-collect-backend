@@ -114,7 +114,14 @@ app.post('/api/members', upload.fields([{ name: 'photo', maxCount: 1 }, { name: 
   if (body.mobile) orClauses.push({ mobile: body.mobile });
   if (orClauses.length) {
     const dup = await Member.findOne({ $or: orClauses });
-    if (dup) return res.status(409).json({ error: 'Member already registered with this Aadhaar/mobile' });
+    if (dup) {
+      // Member exists but may not be linked to this collector — return the existing member
+      // so the collector can proceed to apply a loan for them
+      return res.status(409).json({
+        error: 'Member already registered with this Aadhaar/mobile',
+        existingMember: { memberId: dup.memberId, name: dup.name, mobile: dup.mobile }
+      });
+    }
   }
   const extra = {};
   if (req.files?.photo?.[0]) extra.photo = `data:${req.files.photo[0].mimetype};base64,${req.files.photo[0].buffer.toString('base64')}`;

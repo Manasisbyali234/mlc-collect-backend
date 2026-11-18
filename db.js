@@ -11,7 +11,7 @@ const anyObj = { type: mongoose.Schema.Types.Mixed };
 export const Member = mongoose.model('Member', new mongoose.Schema({
   memberId: String, name: String, mobile: String, altMobile: String,
   dob: String, gender: String, aadhaar: String, pan: String,
-  occupation: String, address: String, village: String, district: String,
+  occupation: String, address: String, village: String, taluk: String, district: String,
   state: String, pin: String, nomName: String, nomRel: String,
   nomMobile: String, nomAddress: String,
 }, { strict: false }));
