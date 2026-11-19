@@ -39,7 +39,7 @@ export const Deposit = mongoose.model('Deposit', new mongoose.Schema({
 
 export const User = mongoose.model('User', new mongoose.Schema({
   id: String, name: String, role: String, mobile: String,
-  branch: String, password: String,
+  branch: String, password: String, status: { type: String, default: 'active' },
 }, { strict: false }));
 
 export const Target = mongoose.model('Target', new mongoose.Schema({

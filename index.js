@@ -24,16 +24,21 @@ app.post('/api/login', async (req, res) => {
   const { password } = req.body;
   const user = await User.findOne({ $or: [{ mobile }, { id: mobile }, { name: mobile }], password });
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  if (user.role === 'collector' && user.status === 'inactive') {
+    return res.status(403).json({ error: 'Your collector account has been deactivated. Please contact the administrator.' });
+  }
   const { password: _, ...safe } = user.toObject();
   res.json(safe);
 });
 
 app.post('/api/otp/send', async (req, res) => {
   const mobile = (req.body.mobile || '').replace(/\s+/g, '');
-  // auto-create collector if not exists
   let user = await User.findOne({ mobile, role: 'collector' });
+  if (user && user.status === 'inactive') {
+    return res.status(403).json({ error: 'Your collector account has been deactivated. Please contact the administrator.' });
+  }
   if (!user) {
-    user = await User.create({ id: genId('USR'), name: mobile, mobile, role: 'collector', password: '' });
+    user = await User.create({ id: genId('USR'), name: mobile, mobile, role: 'collector', password: '', status: 'active' });
   }
   const otp = '123456';
   otpStore[mobile] = { otp, expires: Date.now() + 30 * 60 * 1000 };
@@ -62,8 +67,19 @@ app.post('/api/set-password', async (req, res) => {
   res.json(safe);
 });
 
+/* ── Collector status guard (used by collector-facing endpoints) ── */
+async function requireActiveCollector(req, res, next) {
+  const collectorId = req.query.collectorId || req.body.collectorId;
+  if (!collectorId) return next();
+  const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
+  if (user && user.role === 'collector' && user.status === 'inactive') {
+    return res.status(403).json({ error: 'Your collector account has been deactivated. Please contact the administrator.' });
+  }
+  next();
+}
+
 /* ── Members ── */
-app.get('/api/members', async (req, res) => {
+app.get('/api/members', requireActiveCollector, async (req, res) => {
   const { collectorId } = req.query;
   if (!collectorId) return res.json(await Member.find());
   const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
@@ -131,7 +147,7 @@ app.post('/api/members', upload.fields([{ name: 'photo', maxCount: 1 }, { name: 
 });
 
 /* ── Loan Applications ── */
-app.get('/api/applications', async (req, res) => {
+app.get('/api/applications', requireActiveCollector, async (req, res) => {
   const { collectorId } = req.query;
   if (!collectorId) return res.json(await Application.find());
   const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
@@ -240,7 +256,7 @@ app.post('/api/loan-accounts', async (req, res) => {
 });
 
 /* ── Collections ── */
-app.get('/api/collections', async (req, res) => {
+app.get('/api/collections', requireActiveCollector, async (req, res) => {
   const { collectorId, date } = req.query;
   const filter = {};
   if (collectorId) {
@@ -302,9 +318,31 @@ app.post('/api/users', async (req, res) => {
   res.status(201).json(safe);
 });
 
+app.patch('/api/users/:id', async (req, res) => {
+  const updated = await User.findOneAndUpdate({ id: req.params.id }, req.body, { new: true });
+  if (!updated) return res.status(404).json({ error: 'Not found' });
+  const { password: _, ...safe } = updated.toObject();
+  res.json(safe);
+});
+
 app.delete('/api/users/:id', async (req, res) => {
-  await User.deleteOne({ id: req.params.id });
+  const result = await User.deleteOne({ id: req.params.id });
+  if (result.deletedCount === 0) return res.status(404).json({ error: 'Not found' });
   res.json({ ok: true });
+});
+
+/* ── Collector Stats ── */
+app.get('/api/collectors/stats', async (req, res) => {
+  const [users, apps, collections] = await Promise.all([User.find({ role: 'collector' }), Application.find(), Collection.find()]);
+  const stats = users.map(col => {
+    const colApps = apps.filter(a => a.collectorId === col.id || a.collectorId === col.mobile || a.collectorName === col.name);
+    const memberIds = [...new Set(colApps.map(a => a.memberId))];
+    const colCols = collections.filter(c => c.collectorId === col.id || c.collectorId === col.mobile || c.collectorName === col.name);
+    const totalCollection = colCols.reduce((s, c) => s + Number(c.amount || 0), 0);
+    const { password: _, ...safe } = col.toObject();
+    return { ...safe, customerCount: memberIds.length, totalCollection };
+  });
+  res.json(stats);
 });
 
 /* ── Targets ── */
