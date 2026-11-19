@@ -488,12 +488,13 @@ app.get('/api/dashboard', async (req, res) => {
     }, 0),
     totalInterestCollected: apps.filter(a => a.disbursalDate).reduce((s, a) => {
       const loanAmount = Number(a.loanAmount || 0);
-      const rate = Number(a.confirmedRate || a.rate || 9);
-      return s + Math.round(loanAmount * rate / 100);
+      const totalPaid = collections.filter(c => c.appId === a.appId).reduce((x, c) => x + (Number(c.amount) || 0), 0);
+      const principalRepaid = Math.min(totalPaid, loanAmount);
+      return s + Math.max(0, totalPaid - principalRepaid);
     }, 0),
     totalDoorstepCharges: apps.filter(a => a.disbursalDate).reduce((s, a) => {
       const tenure = Number(a.approvedTenure || a.tenure || 0);
-      return s + Math.round(6.80 * tenure * 100) / 100;
+      return s + Math.round(7.40 * tenure * 100) / 100;
     }, 0),
     closedLoans: apps.filter(a => a.status === 'Disbursed').filter(a => {
       const la = loanAccounts.find(l => l.appId === a.appId);
