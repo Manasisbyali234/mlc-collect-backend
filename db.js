@@ -1,8 +1,11 @@
 import mongoose from 'mongoose';
-import 'dotenv/config';
+
+let isConnected = false;
 
 export async function connectDB() {
+  if (isConnected && mongoose.connection.readyState === 1) return;
   await mongoose.connect(process.env.MONGO_URI);
+  isConnected = true;
   console.log('MongoDB Atlas connected');
 }
 

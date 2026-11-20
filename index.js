@@ -8,6 +8,14 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// Ensure DB is connected on every request (required for Vercel serverless)
+app.use(async (req, res, next) => {
+  try { await connectDB(); next(); } catch (err) { 
+    console.error('DB connection error:', err.message);
+    res.status(500).json({ error: 'DB connection failed: ' + err.message }); 
+  }
+});
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 app.get('/', (req, res) => res.json({ status: 'MLC Backend is running' }));
@@ -69,13 +77,17 @@ app.post('/api/set-password', async (req, res) => {
 
 /* ── Collector status guard (used by collector-facing endpoints) ── */
 async function requireActiveCollector(req, res, next) {
-  const collectorId = req.query.collectorId || req.body.collectorId;
-  if (!collectorId) return next();
-  const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
-  if (user && user.role === 'collector' && user.status === 'inactive') {
-    return res.status(403).json({ error: 'Your collector account has been deactivated. Please contact the administrator.' });
+  const collectorId = req.query.collectorId || (req.body && req.body.collectorId);
+  if (!collectorId) return next(); // skip DB lookup entirely for admin calls
+  try {
+    const user = await User.findOne({ $or: [{ id: collectorId }, { mobile: collectorId }] });
+    if (user && user.role === 'collector' && user.status === 'inactive') {
+      return res.status(403).json({ error: 'Your collector account has been deactivated. Please contact the administrator.' });
+    }
+    next();
+  } catch (err) {
+    next(); // don't block on middleware failure
   }
-  next();
 }
 
 /* ── Members ── */
@@ -1313,6 +1325,10 @@ app.post('/api/sanction-letters/:id/regenerate', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-connectDB()
-  .then(() => app.listen(PORT, () => console.log(`MLC backend running on http://localhost:${PORT}`)))
-  .catch(err => { console.error('Failed to connect to DB:', err.message); process.exit(1); });
+if (process.env.NODE_ENV !== 'production') {
+  connectDB()
+    .then(() => app.listen(PORT, () => console.log(`MLC backend running on http://localhost:${PORT}`)))
+    .catch(err => { console.error('Failed to connect to DB:', err.message); process.exit(1); });
+}
+
+export default app;
