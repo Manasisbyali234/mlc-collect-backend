@@ -5,7 +5,18 @@ import multer from 'multer';
 import { connectDB, Member, Application, LoanAccount, Collection, Deposit, User, Target, SanctionLetter } from './db.js';
 
 const app = express();
-app.use(cors({ origin: '*' }));
+const allowedOrigins = [
+  'https://mlc.migroups.co.in',
+  'http://localhost:5173',
+  'http://localhost:3000',
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error('CORS: origin not allowed'));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 // Ensure DB is connected on every request (required for Vercel serverless)
@@ -1325,10 +1336,8 @@ app.post('/api/sanction-letters/:id/regenerate', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-if (process.env.NODE_ENV !== 'production') {
-  connectDB()
-    .then(() => app.listen(PORT, () => console.log(`MLC backend running on http://localhost:${PORT}`)))
-    .catch(err => { console.error('Failed to connect to DB:', err.message); process.exit(1); });
-}
+connectDB()
+  .then(() => app.listen(PORT, () => console.log(`MLC backend running on port ${PORT}`)))
+  .catch(err => { console.error('Failed to connect to DB:', err.message); process.exit(1); });
 
 export default app;
