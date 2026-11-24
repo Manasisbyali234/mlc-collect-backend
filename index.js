@@ -6,6 +6,7 @@ import { connectDB, Member, Application, LoanAccount, Collection, Deposit, User,
 
 const app = express();
 const allowedOrigins = [
+  'http://mlc.migroups.co.in',
   'https://mlc.migroups.co.in',
   'http://localhost:5173',
   'http://localhost:3000',
@@ -15,8 +16,11 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error('CORS: origin not allowed'));
   },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
+app.options('*', cors());
 app.use(express.json());
 
 // Ensure DB is connected on every request (required for Vercel serverless)
