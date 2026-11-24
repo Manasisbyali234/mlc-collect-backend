@@ -20,7 +20,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
-app.options('*', cors());
+app.options('/{*splat}', cors());
 app.use(express.json());
 
 // Ensure DB is connected on every request (required for Vercel serverless)
