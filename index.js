@@ -1,4 +1,15 @@
-import 'dotenv/config';
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+require('dotenv').config({ path: join(__dirname, '.env') });
+
+if (!process.env.MONGO_URI) {
+  console.error('ERROR: MONGO_URI is not set. Add it to the .env file in the backend root directory.');
+  process.exit(1);
+}
+
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
