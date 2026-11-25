@@ -22,7 +22,7 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
 ];
-app.use(cors({
+const corsOptions = {
   origin: (origin, cb) => {
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error('CORS: origin not allowed'));
@@ -30,8 +30,9 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
-}));
-app.options('/{*splat}', cors());
+};
+app.use(cors(corsOptions));
+app.options('/{*splat}', cors(corsOptions));
 app.use(express.json());
 
 // Ensure DB is connected on every request (required for Vercel serverless)
