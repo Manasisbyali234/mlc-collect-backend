@@ -19,6 +19,7 @@ const app = express();
 const allowedOrigins = [
   'http://mlc.migroups.co.in',
   'https://mlc.migroups.co.in',
+  'https://mlc-collect-frontend1.vercel.app',
   'http://localhost:5173',
   'http://localhost:3000',
 ];
