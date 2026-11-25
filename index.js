@@ -11,7 +11,6 @@ if (!process.env.MONGO_URI) {
 }
 
 import express from 'express';
-import cors from 'cors';
 import multer from 'multer';
 import { connectDB, Member, Application, LoanAccount, Collection, Deposit, User, Target, SanctionLetter } from './db.js';
 
@@ -23,18 +22,21 @@ const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:3000',
 ];
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error('CORS: origin not allowed'));
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
-app.options('/{*splat}', cors(corsOptions));
+
+// Always set CORS headers first — before any middleware that could throw
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    res.set('Access-Control-Allow-Origin', '*');
+  }
+  res.set('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.set('Access-Control-Allow-Credentials', 'true');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(express.json());
 
 // Ensure DB is connected on every request (required for Vercel serverless)
